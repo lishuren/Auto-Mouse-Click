@@ -3,3 +3,7 @@ bin/
 obj/
 *.user
 *.suo
+*.cache
+*.pdb
+*.tmp
+*.log
