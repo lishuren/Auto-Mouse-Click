@@ -138,9 +138,9 @@ namespace AutoMouseClick
             lblHotkey.AutoSize = true;
             lblHotkey.Location = new Point(180, 113);
             lblHotkey.Name = "lblHotkey";
-            lblHotkey.Size = new Size(442, 17);
+            lblHotkey.Size = new Size(420, 17);
             lblHotkey.TabIndex = 4;
-            lblHotkey.Text = "Hotkeys: F6 replay / capture+click, F7 capture step, F8 arm/stop recording";
+            lblHotkey.Text = "Hotkeys: F6 replay, F7 capture step, F8 start/stop recording";
             // 
             // trayMenu
             // 
@@ -331,7 +331,7 @@ namespace AutoMouseClick
             btnRecordStep.Name = "btnRecordStep";
             btnRecordStep.Size = new Size(150, 34);
             btnRecordStep.TabIndex = 3;
-            btnRecordStep.Text = "Capture step (F6)";
+            btnRecordStep.Text = "Add pending step (F7)";
             btnRecordStep.UseVisualStyleBackColor = true;
             btnRecordStep.Click += btnRecordStep_Click;
             // 
@@ -357,12 +357,12 @@ namespace AutoMouseClick
             // 
             // lblRecordingHelp
             // 
-            lblRecordingHelp.AutoSize = true;
-            lblRecordingHelp.Location = new Point(14, 27);
+            lblRecordingHelp.AutoSize = false;
+            lblRecordingHelp.Location = new Point(14, 24);
             lblRecordingHelp.Name = "lblRecordingHelp";
-            lblRecordingHelp.Size = new Size(575, 17);
+            lblRecordingHelp.Size = new Size(470, 30);
             lblRecordingHelp.TabIndex = 0;
-            lblRecordingHelp.Text = "1. Press F8 to arm recording  2. Move cursor  3. Press F6 to capture and click  4. Press F8 to stop";
+            lblRecordingHelp.Text = "Press F8 to start recording. Press F7 to add a pending step, then perform the next mouse or keyboard action. Select a step and press F7 to replace it.";
             // 
             // lblRecordedActions
             // 

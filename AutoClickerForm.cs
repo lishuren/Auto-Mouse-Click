@@ -6,22 +6,64 @@ namespace AutoMouseClick
     public partial class AutoClickerForm : Form
     {
         private const int ReplayHotkeyId = 1001;
-        private const int CaptureStepHotkeyId = 1002;
+        private const int AddPlaceholderHotkeyId = 1002;
         private const int ToggleRecordingHotkeyId = 1003;
         private const int MinDelayMilliseconds = 1;
         private const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
         private const uint MOUSEEVENTF_LEFTUP = 0x0004;
         private const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
         private const uint MOUSEEVENTF_RIGHTUP = 0x0010;
+        private const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
+        private const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
         private const int WM_HOTKEY = 0x0312;
+        private const byte KEYEVENTF_KEYUP = 0x02;
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WH_MOUSE_LL = 14;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_SYSKEYDOWN = 0x0104;
+        private const int WM_LBUTTONDOWN = 0x0201;
+        private const int WM_RBUTTONDOWN = 0x0204;
+        private const int WM_MBUTTONDOWN = 0x0207;
+        private const int WM_LBUTTONDBLCLK = 0x0203;
+        private const int WM_RBUTTONDBLCLK = 0x0206;
+        private const int WM_MBUTTONDBLCLK = 0x0209;
 
         private readonly string _settingsPath = Path.Combine(Application.StartupPath, "settings.json");
         private readonly List<RecordedAction> _recordedActions = new();
+        private readonly LowLevelKeyboardProc _keyboardHookProc;
+        private readonly LowLevelMouseProc _mouseHookProc;
         private CancellationTokenSource? _replayCancellationTokenSource;
+        private IntPtr _keyboardHook = IntPtr.Zero;
+        private IntPtr _mouseHook = IntPtr.Zero;
         private bool _allowClose;
         private bool _isRecording;
         private bool _isReplayingSequence;
+        private bool _captureNextActionForEdit;
+        private int _editCaptureIndex = -1;
+        private int _pendingPlaceholderIndex = -1;
         private int _currentReplayStepIndex = -1;
+        private Keys? _ignoredCaptureKey;
+        private bool _ignoredCaptureKeyConsumed;
+
+        private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+        private delegate IntPtr LowLevelMouseProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct POINT
+        {
+            public int X;
+            public int Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct MSLLHOOKSTRUCT
+        {
+            public POINT pt;
+            public uint mouseData;
+            public uint flags;
+            public uint time;
+            public nuint dwExtraInfo;
+        }
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
@@ -32,24 +74,44 @@ namespace AutoMouseClick
         [DllImport("user32.dll")]
         private static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, nuint dwExtraInfo);
 
+        [DllImport("user32.dll")]
+        private static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, nuint dwExtraInfo);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, Delegate lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string? lpModuleName);
+
         public AutoClickerForm()
         {
             InitializeComponent();
+            MouseDown += AutoClickerForm_MouseDown;
+            _keyboardHookProc = KeyboardHookCallback;
+            _mouseHookProc = MouseHookCallback;
         }
 
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
             RegisterHotKey(Handle, ReplayHotkeyId, 0, (uint)Keys.F6);
-            RegisterHotKey(Handle, CaptureStepHotkeyId, 0, (uint)Keys.F7);
+            RegisterHotKey(Handle, AddPlaceholderHotkeyId, 0, (uint)Keys.F7);
             RegisterHotKey(Handle, ToggleRecordingHotkeyId, 0, (uint)Keys.F8);
+            InstallCaptureHooks();
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
         {
             UnregisterHotKey(Handle, ReplayHotkeyId);
-            UnregisterHotKey(Handle, CaptureStepHotkeyId);
+            UnregisterHotKey(Handle, AddPlaceholderHotkeyId);
             UnregisterHotKey(Handle, ToggleRecordingHotkeyId);
+            UninstallCaptureHooks();
             _replayCancellationTokenSource?.Cancel();
             _replayCancellationTokenSource?.Dispose();
             base.OnHandleDestroyed(e);
@@ -64,8 +126,8 @@ namespace AutoMouseClick
                     case ReplayHotkeyId:
                         ToggleReplay();
                         return;
-                    case CaptureStepHotkeyId:
-                        CaptureRecordedStep();
+                    case AddPlaceholderHotkeyId:
+                        TriggerStepCapture(Keys.F7);
                         return;
                     case ToggleRecordingHotkeyId:
                         ToggleRecording();
@@ -74,6 +136,11 @@ namespace AutoMouseClick
             }
 
             base.WndProc(ref m);
+        }
+
+        protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
+        {
+            return base.ProcessCmdKey(ref msg, keyData);
         }
 
         private void AutoClickerForm_Load(object sender, EventArgs e)
@@ -87,100 +154,194 @@ namespace AutoMouseClick
 
         private void AutoClickerForm_KeyDown(object sender, KeyEventArgs e)
         {
-            if (e.KeyCode == Keys.F6)
+            if (e.KeyCode == Keys.F6 || e.KeyCode == Keys.F7 || e.KeyCode == Keys.F8)
             {
-                ToggleReplay();
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-            }
-            else if (e.KeyCode == Keys.F7)
-            {
-                CaptureRecordedStep();
-                e.Handled = true;
-                e.SuppressKeyPress = true;
-            }
-            else if (e.KeyCode == Keys.F8)
-            {
-                ToggleRecording();
                 e.Handled = true;
                 e.SuppressKeyPress = true;
             }
         }
 
-        private void AutoClickerForm_Resize(object sender, EventArgs e)
+        private void AutoClickerForm_MouseDown(object? sender, MouseEventArgs e)
         {
-            if (WindowState == FormWindowState.Minimized && chkMinimizeToTray.Checked)
+            if (_captureNextActionForEdit)
             {
-                HideToTray();
-            }
-        }
+                var mouseButton = e.Button switch
+                {
+                    MouseButtons.Right => MouseButtonType.Right,
+                    MouseButtons.Middle => MouseButtonType.Middle,
+                    _ => MouseButtonType.Left
+                };
 
-        private void AutoClickerForm_FormClosing(object sender, FormClosingEventArgs e)
-        {
-            if (!_allowClose && chkMinimizeToTray.Checked && e.CloseReason == CloseReason.UserClosing)
-            {
-                e.Cancel = true;
-                HideToTray();
+                var clickMode = e.Clicks >= 2 ? ClickModeType.Double : ClickModeType.Single;
+                UpdateSelectedStepFromMouse(Cursor.Position, mouseButton, clickMode);
                 return;
             }
 
-            StopReplay();
+            if (_pendingPlaceholderIndex < 0)
+            {
+                return;
+            }
+
+            var pendingMouseButton = e.Button switch
+            {
+                MouseButtons.Right => MouseButtonType.Right,
+                MouseButtons.Middle => MouseButtonType.Middle,
+                _ => MouseButtonType.Left
+            };
+
+            var pendingClickMode = e.Clicks >= 2 ? ClickModeType.Double : ClickModeType.Single;
+            FillPendingPlaceholderWithMouse(Cursor.Position, pendingMouseButton, pendingClickMode);
+        }
+
+        private void TriggerStepCapture(Keys? ignoredCaptureKey = null)
+        {
+            if (_captureNextActionForEdit || _pendingPlaceholderIndex >= 0)
+            {
+                return;
+            }
+
+            _ignoredCaptureKey = ignoredCaptureKey;
+            _ignoredCaptureKeyConsumed = ignoredCaptureKey is null;
+
+            if (_isRecording)
+            {
+                AddPlaceholderStep();
+                return;
+            }
+
+            if (lstRecordedActions.SelectedIndex >= 0)
+            {
+                ArmCaptureForSelectedStep();
+            }
+        }
+
+        private void UpdateSelectedStepFromMouse(Point position, MouseButtonType mouseButton, ClickModeType clickMode)
+        {
+            if (_editCaptureIndex < 0 || _editCaptureIndex >= _recordedActions.Count)
+            {
+                _captureNextActionForEdit = false;
+                _editCaptureIndex = -1;
+                _ignoredCaptureKey = null;
+                _ignoredCaptureKeyConsumed = false;
+                UpdateUiState();
+                return;
+            }
+
+            var existing = _recordedActions[_editCaptureIndex];
+            existing.IsPlaceholder = false;
+            existing.ActionType = RecordedActionType.Mouse;
+            existing.X = position.X;
+            existing.Y = position.Y;
+            existing.MouseButton = mouseButton;
+            existing.ClickMode = clickMode;
+            _recordedActions[_editCaptureIndex] = existing;
+            _captureNextActionForEdit = false;
+            var selectedIndex = _editCaptureIndex;
+            _editCaptureIndex = -1;
+            _ignoredCaptureKey = null;
+            _ignoredCaptureKeyConsumed = false;
+            RefreshRecordedActionsList();
+            lstRecordedActions.SelectedIndex = selectedIndex;
             SaveSettings();
-            notifyIconApp.Visible = false;
+            UpdateUiState();
         }
 
-        private void btnStartStop_Click(object sender, EventArgs e)
+        private void FillPendingPlaceholderWithMouse(Point position, MouseButtonType mouseButton, ClickModeType clickMode)
         {
-            ToggleReplay();
+            if (_pendingPlaceholderIndex < 0 || _pendingPlaceholderIndex >= _recordedActions.Count)
+            {
+                return;
+            }
+
+            var action = _recordedActions[_pendingPlaceholderIndex];
+            action.IsPlaceholder = false;
+            action.ActionType = RecordedActionType.Mouse;
+            action.X = position.X;
+            action.Y = position.Y;
+            action.MouseButton = mouseButton;
+            action.ClickMode = clickMode;
+            _recordedActions[_pendingPlaceholderIndex] = action;
+            var selectedIndex = _pendingPlaceholderIndex;
+            _pendingPlaceholderIndex = -1;
+            _ignoredCaptureKey = null;
+            _ignoredCaptureKeyConsumed = false;
+            RefreshRecordedActionsList();
+            lstRecordedActions.SelectedIndex = selectedIndex;
+            SaveSettings();
+            UpdateUiState();
         }
 
-        private void btnStartRecording_Click(object sender, EventArgs e)
+        private void FillPendingPlaceholderWithKeyboard(Keys keyCode)
         {
-            StartRecording();
+            if (_pendingPlaceholderIndex < 0 || _pendingPlaceholderIndex >= _recordedActions.Count)
+            {
+                return;
+            }
+
+            var action = _recordedActions[_pendingPlaceholderIndex];
+            action.IsPlaceholder = false;
+            action.ActionType = RecordedActionType.Keyboard;
+            action.KeyCode = keyCode;
+            action.KeyAction = KeyActionType.KeyPress;
+            _recordedActions[_pendingPlaceholderIndex] = action;
+            var selectedIndex = _pendingPlaceholderIndex;
+            _pendingPlaceholderIndex = -1;
+            _ignoredCaptureKey = null;
+            _ignoredCaptureKeyConsumed = false;
+            RefreshRecordedActionsList();
+            lstRecordedActions.SelectedIndex = selectedIndex;
+            SaveSettings();
+            UpdateUiState();
         }
 
-        private void btnStopRecording_Click(object sender, EventArgs e)
+        private void CaptureEditedKeyboardAction(Keys keyCode)
         {
-            StopRecording();
+            if (_editCaptureIndex < 0 || _editCaptureIndex >= _recordedActions.Count)
+            {
+                _captureNextActionForEdit = false;
+                _editCaptureIndex = -1;
+                _ignoredCaptureKey = null;
+                _ignoredCaptureKeyConsumed = false;
+                UpdateUiState();
+                return;
+            }
+
+            var existing = _recordedActions[_editCaptureIndex];
+            existing.IsPlaceholder = false;
+            existing.ActionType = RecordedActionType.Keyboard;
+            existing.KeyCode = keyCode;
+            existing.KeyAction = KeyActionType.KeyPress;
+            _recordedActions[_editCaptureIndex] = existing;
+            _captureNextActionForEdit = false;
+            var selectedIndex = _editCaptureIndex;
+            _editCaptureIndex = -1;
+            _ignoredCaptureKey = null;
+            _ignoredCaptureKeyConsumed = false;
+            RefreshRecordedActionsList();
+            lstRecordedActions.SelectedIndex = selectedIndex;
+            SaveSettings();
+            UpdateUiState();
         }
 
-        private void btnRecordStep_Click(object sender, EventArgs e)
-        {
-            CaptureRecordedStep();
-        }
-
-        private void btnEditStep_Click(object sender, EventArgs e)
-        {
-            EditSelectedStep();
-        }
-
-        private void btnRemoveStep_Click(object sender, EventArgs e)
-        {
-            RemoveSelectedStep();
-        }
+        private void btnStartStop_Click(object sender, EventArgs e) => ToggleReplay();
+        private void btnStartRecording_Click(object sender, EventArgs e) => StartRecording();
+        private void btnStopRecording_Click(object sender, EventArgs e) => StopRecording();
+        private void btnRecordStep_Click(object sender, EventArgs e) => TriggerStepCapture();
+        private void btnEditStep_Click(object sender, EventArgs e) => EditSelectedStep();
+        private void btnRemoveStep_Click(object sender, EventArgs e) => RemoveSelectedStep();
 
         private void btnClearSequence_Click(object sender, EventArgs e)
         {
             _recordedActions.Clear();
+            _pendingPlaceholderIndex = -1;
             RefreshRecordedActionsList();
             SaveSettings();
             UpdateUiState();
         }
 
-        private async void btnReplaySequence_Click(object sender, EventArgs e)
-        {
-            await ReplayRecordedSequenceAsync();
-        }
-
-        private void lstRecordedActions_SelectedIndexChanged(object sender, EventArgs e)
-        {
-            UpdateUiState();
-        }
-
-        private void lstRecordedActions_DoubleClick(object sender, EventArgs e)
-        {
-            EditSelectedStep();
-        }
+        private async void btnReplaySequence_Click(object sender, EventArgs e) => await ReplayRecordedSequenceAsync();
+        private void lstRecordedActions_SelectedIndexChanged(object sender, EventArgs e) => UpdateUiState();
+        private void lstRecordedActions_DoubleClick(object sender, EventArgs e) => EditSelectedStep();
 
         private void lstRecordedActions_MouseDown(object sender, MouseEventArgs e)
         {
@@ -191,25 +352,10 @@ namespace AutoMouseClick
             }
         }
 
-        private void editStepMenuItem_Click(object sender, EventArgs e)
-        {
-            EditSelectedStep();
-        }
-
-        private void removeStepMenuItem_Click(object sender, EventArgs e)
-        {
-            RemoveSelectedStep();
-        }
-
-        private void trayOpenMenuItem_Click(object sender, EventArgs e)
-        {
-            ShowFromTray();
-        }
-
-        private void trayStartStopMenuItem_Click(object sender, EventArgs e)
-        {
-            ToggleReplay();
-        }
+        private void editStepMenuItem_Click(object sender, EventArgs e) => EditSelectedStep();
+        private void removeStepMenuItem_Click(object sender, EventArgs e) => RemoveSelectedStep();
+        private void trayOpenMenuItem_Click(object sender, EventArgs e) => ShowFromTray();
+        private void trayStartStopMenuItem_Click(object sender, EventArgs e) => ToggleReplay();
 
         private void trayExitMenuItem_Click(object sender, EventArgs e)
         {
@@ -217,18 +363,30 @@ namespace AutoMouseClick
             Close();
         }
 
-        private void notifyIconApp_DoubleClick(object sender, EventArgs e)
+        private void notifyIconApp_DoubleClick(object sender, EventArgs e) => ShowFromTray();
+        private void clickTimer_Tick(object sender, EventArgs e) { }
+        private void ReplayModeChanged(object sender, EventArgs e) => UpdateReplayModeControls();
+
+        private void AutoClickerForm_FormClosing(object? sender, FormClosingEventArgs e)
         {
-            ShowFromTray();
+            if (_allowClose)
+            {
+                return;
+            }
+
+            if (chkMinimizeToTray.Checked)
+            {
+                e.Cancel = true;
+                HideToTray();
+            }
         }
 
-        private void clickTimer_Tick(object sender, EventArgs e)
+        private void AutoClickerForm_Resize(object? sender, EventArgs e)
         {
-        }
-
-        private void ReplayModeChanged(object sender, EventArgs e)
-        {
-            UpdateReplayModeControls();
+            if (chkMinimizeToTray.Checked && WindowState == FormWindowState.Minimized)
+            {
+                HideToTray();
+            }
         }
 
         private void ToggleRecording()
@@ -258,6 +416,7 @@ namespace AutoMouseClick
         private void StopRecording()
         {
             _isRecording = false;
+            _pendingPlaceholderIndex = -1;
             SaveSettings();
             UpdateReplayModeControls();
             UpdateUiState();
@@ -265,12 +424,6 @@ namespace AutoMouseClick
 
         private void ToggleReplay()
         {
-            if (_isRecording)
-            {
-                CaptureRecordedStepAndClick();
-                return;
-            }
-
             if (_isReplayingSequence)
             {
                 StopReplay();
@@ -281,53 +434,60 @@ namespace AutoMouseClick
             _ = ReplayRecordedSequenceAsync();
         }
 
-        private void CaptureRecordedStep()
+        private void AddPlaceholderStep()
         {
-            if (!_isRecording)
+            if (!_isRecording || _pendingPlaceholderIndex >= 0)
             {
                 return;
             }
 
-            var delay = Math.Max(MinDelayMilliseconds, (int)nudDefaultDelay.Value);
-            var targetPosition = Cursor.Position;
-            AddRecordedAction(targetPosition, MouseButtonType.Left, ClickModeType.Single, delay);
-        }
-
-        private void CaptureRecordedStepAndClick()
-        {
-            if (!_isRecording)
+            var action = new RecordedAction
             {
-                return;
-            }
+                DelayMilliseconds = Math.Max(MinDelayMilliseconds, (int)nudDefaultDelay.Value),
+                IsPlaceholder = true
+            };
 
-            var delay = Math.Max(MinDelayMilliseconds, (int)nudDefaultDelay.Value);
-            var targetPosition = Cursor.Position;
-            AddRecordedAction(targetPosition, MouseButtonType.Left, ClickModeType.Single, delay);
-            ExecuteClick(targetPosition, MouseButtonType.Left, ClickModeType.Single);
-        }
-
-        private void AddRecordedAction(Point position, MouseButtonType mouseButton, ClickModeType clickMode, int delayMilliseconds)
-        {
-            _recordedActions.Add(new RecordedAction
-            {
-                DelayMilliseconds = Math.Max(MinDelayMilliseconds, delayMilliseconds),
-                X = position.X,
-                Y = position.Y,
-                MouseButton = mouseButton,
-                ClickMode = clickMode
-            });
-
+            _recordedActions.Add(action);
+            _pendingPlaceholderIndex = _recordedActions.Count - 1;
             RefreshRecordedActionsList();
-            lstRecordedActions.SelectedIndex = _recordedActions.Count - 1;
+            lstRecordedActions.SelectedIndex = _pendingPlaceholderIndex;
             SaveSettings();
+            UpdateUiState();
+        }
+
+        private void ArmCaptureForSelectedStep()
+        {
+            if (lstRecordedActions.SelectedIndex < 0)
+            {
+                return;
+            }
+
+            _captureNextActionForEdit = true;
+            _editCaptureIndex = lstRecordedActions.SelectedIndex;
             UpdateUiState();
         }
 
         private async Task ReplayRecordedSequenceAsync()
         {
-            if (_recordedActions.Count == 0)
+            var replayActions = _recordedActions
+                .Where(action => !action.IsPlaceholder)
+                .Select(action => new RecordedAction
+                {
+                    DelayMilliseconds = Math.Max(MinDelayMilliseconds, action.DelayMilliseconds),
+                    ActionType = action.ActionType,
+                    X = action.X,
+                    Y = action.Y,
+                    MouseButton = action.MouseButton,
+                    ClickMode = action.ClickMode,
+                    KeyCode = action.KeyCode,
+                    KeyAction = action.KeyAction,
+                    IsPlaceholder = false
+                })
+                .ToList();
+
+            if (replayActions.Count == 0)
             {
-                MessageBox.Show(this, "There are no recorded steps to replay.", "No sequence", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show(this, "There are no completed steps to replay.", "No sequence", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
 
@@ -336,23 +496,13 @@ namespace AutoMouseClick
                 return;
             }
 
-            var replayActions = _recordedActions
-                .Select(action => new RecordedAction
-                {
-                    DelayMilliseconds = Math.Max(MinDelayMilliseconds, action.DelayMilliseconds),
-                    X = action.X,
-                    Y = action.Y,
-                    MouseButton = action.MouseButton,
-                    ClickMode = action.ClickMode
-                })
-                .ToList();
-
             _replayCancellationTokenSource?.Dispose();
             _replayCancellationTokenSource = new CancellationTokenSource();
             var cancellationToken = _replayCancellationTokenSource.Token;
 
             _isReplayingSequence = true;
             _isRecording = false;
+            _pendingPlaceholderIndex = -1;
             _currentReplayStepIndex = -1;
             UpdateReplayModeControls();
             UpdateUiState();
@@ -366,14 +516,17 @@ namespace AutoMouseClick
                 {
                     foreach (var pair in replayActions.Select((action, index) => new { action, index }))
                     {
-                        _currentReplayStepIndex = pair.index;
-                        lstRecordedActions.SelectedIndex = pair.index;
+                        _currentReplayStepIndex = indexOfCompletedStep(pair.action);
+                        if (_currentReplayStepIndex >= 0)
+                        {
+                            lstRecordedActions.SelectedIndex = _currentReplayStepIndex;
+                        }
                         UpdateUiState();
 
                         cancellationToken.ThrowIfCancellationRequested();
                         await Task.Delay(pair.action.DelayMilliseconds, cancellationToken);
                         cancellationToken.ThrowIfCancellationRequested();
-                        ExecuteClick(new Point(pair.action.X, pair.action.Y), pair.action.MouseButton, pair.action.ClickMode);
+                        ExecuteRecordedAction(pair.action);
                     }
                 }
             }
@@ -393,6 +546,28 @@ namespace AutoMouseClick
                 UpdateReplayModeControls();
                 UpdateUiState();
             }
+
+            int indexOfCompletedStep(RecordedAction action)
+            {
+                for (var i = 0; i < _recordedActions.Count; i++)
+                {
+                    var candidate = _recordedActions[i];
+                    if (!candidate.IsPlaceholder
+                        && candidate.ActionType == action.ActionType
+                        && candidate.DelayMilliseconds == action.DelayMilliseconds
+                        && candidate.X == action.X
+                        && candidate.Y == action.Y
+                        && candidate.MouseButton == action.MouseButton
+                        && candidate.ClickMode == action.ClickMode
+                        && candidate.KeyCode == action.KeyCode
+                        && candidate.KeyAction == action.KeyAction)
+                    {
+                        return i;
+                    }
+                }
+
+                return -1;
+            }
         }
 
         private void StopReplay()
@@ -404,29 +579,68 @@ namespace AutoMouseClick
             _currentReplayStepIndex = -1;
         }
 
-        private void ExecuteClick(Point targetPosition, MouseButtonType mouseButton, ClickModeType clickMode)
+        private void ExecuteRecordedAction(RecordedAction action)
         {
-            Cursor.Position = targetPosition;
-            ExecuteMouseClick(mouseButton);
+            if (action.ActionType == RecordedActionType.Keyboard)
+            {
+                ExecuteKeyboardAction(action);
+                return;
+            }
 
-            if (clickMode == ClickModeType.Double)
+            ExecuteMouseAction(action);
+        }
+
+        private void ExecuteMouseAction(RecordedAction action)
+        {
+            Cursor.Position = new Point(action.X, action.Y);
+            ExecuteMouseClick(action.MouseButton);
+
+            if (action.ClickMode == ClickModeType.Double)
             {
                 Thread.Sleep(80);
-                ExecuteMouseClick(mouseButton);
+                ExecuteMouseClick(action.MouseButton);
+            }
+        }
+
+        private void ExecuteKeyboardAction(RecordedAction action)
+        {
+            if (action.KeyCode == Keys.None)
+            {
+                return;
+            }
+
+            var key = (byte)action.KeyCode;
+            switch (action.KeyAction)
+            {
+                case KeyActionType.KeyDown:
+                    keybd_event(key, 0, 0, 0);
+                    break;
+                case KeyActionType.KeyUp:
+                    keybd_event(key, 0, KEYEVENTF_KEYUP, 0);
+                    break;
+                default:
+                    keybd_event(key, 0, 0, 0);
+                    keybd_event(key, 0, KEYEVENTF_KEYUP, 0);
+                    break;
             }
         }
 
         private void ExecuteMouseClick(MouseButtonType mouseButton)
         {
-            if (mouseButton == MouseButtonType.Left)
+            switch (mouseButton)
             {
-                mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
-                mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
-            }
-            else
-            {
-                mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
-                mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                case MouseButtonType.Right:
+                    mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0);
+                    mouse_event(MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0);
+                    break;
+                case MouseButtonType.Middle:
+                    mouse_event(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0, 0);
+                    mouse_event(MOUSEEVENTF_MIDDLEUP, 0, 0, 0, 0);
+                    break;
+                default:
+                    mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+                    mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+                    break;
             }
         }
 
@@ -439,7 +653,16 @@ namespace AutoMouseClick
 
             var index = lstRecordedActions.SelectedIndex;
             using var dialog = new StepEditForm(_recordedActions[index]);
-            if (dialog.ShowDialog(this) != DialogResult.OK)
+            var result = dialog.ShowDialog(this);
+            if (result == DialogResult.Retry && dialog.CaptureRequested)
+            {
+                _captureNextActionForEdit = true;
+                _editCaptureIndex = index;
+                UpdateUiState();
+                return;
+            }
+
+            if (result != DialogResult.OK)
             {
                 return;
             }
@@ -460,6 +683,15 @@ namespace AutoMouseClick
 
             var index = lstRecordedActions.SelectedIndex;
             _recordedActions.RemoveAt(index);
+            if (_pendingPlaceholderIndex == index)
+            {
+                _pendingPlaceholderIndex = -1;
+            }
+            else if (_pendingPlaceholderIndex > index)
+            {
+                _pendingPlaceholderIndex--;
+            }
+
             RefreshRecordedActionsList();
 
             if (_recordedActions.Count > 0)
@@ -479,7 +711,12 @@ namespace AutoMouseClick
             for (var index = 0; index < _recordedActions.Count; index++)
             {
                 var action = _recordedActions[index];
-                lstRecordedActions.Items.Add($"{index + 1}. wait {action.DelayMilliseconds} ms, {action.MouseButton} {action.ClickMode} at ({action.X}, {action.Y})");
+                var text = action.IsPlaceholder
+                    ? $"{index + 1}. [Pending] wait {action.DelayMilliseconds} ms, capture next action"
+                    : action.ActionType == RecordedActionType.Keyboard
+                        ? $"{index + 1}. wait {action.DelayMilliseconds} ms, key {action.KeyCode} ({action.KeyAction})"
+                        : $"{index + 1}. wait {action.DelayMilliseconds} ms, {action.MouseButton} {action.ClickMode} at ({action.X}, {action.Y})";
+                lstRecordedActions.Items.Add(text);
             }
 
             if (_recordedActions.Count > 0)
@@ -506,28 +743,37 @@ namespace AutoMouseClick
         {
             var hasSelection = lstRecordedActions.SelectedIndex >= 0;
             btnStartStop.Text = _isReplayingSequence ? "Stop replay (F6)" : "Replay sequence (F6)";
-            lblStatus.Text = _isRecording
-                ? $"Recording armed ({_recordedActions.Count} steps)"
-                : _isReplayingSequence
-                    ? _currentReplayStepIndex >= 0
-                        ? $"Replaying step {_currentReplayStepIndex + 1}/{_recordedActions.Count}"
-                        : "Replaying sequence"
-                    : "Stopped";
-            lblStatus.ForeColor = _isRecording || _isReplayingSequence ? Color.DarkGreen : Color.DarkRed;
+            lblStatus.Text = _captureNextActionForEdit
+                ? $"Step {_editCaptureIndex + 1}: perform next action to update it"
+                : _pendingPlaceholderIndex >= 0
+                    ? $"Step {_pendingPlaceholderIndex + 1} pending: perform next mouse or key action"
+                    : _isRecording
+                        ? $"Recording armed ({_recordedActions.Count} steps)"
+                        : _isReplayingSequence
+                            ? _currentReplayStepIndex >= 0
+                                ? $"Replaying step {_currentReplayStepIndex + 1}/{_recordedActions.Count}"
+                                : "Replaying sequence"
+                            : "Stopped";
+            lblStatus.ForeColor = _isRecording || _isReplayingSequence || _captureNextActionForEdit || _pendingPlaceholderIndex >= 0 ? Color.DarkGreen : Color.DarkRed;
             trayStartStopMenuItem.Text = _isReplayingSequence ? "Stop replay" : "Replay";
-            notifyIconApp.Text = _isRecording
-                ? "Auto Mouse Click - Recording armed"
-                : _isReplayingSequence
-                    ? "Auto Mouse Click - Replaying sequence"
-                    : "Auto Mouse Click - Stopped";
-            btnReplaySequence.Enabled = _recordedActions.Count > 0 && !_isReplayingSequence;
-            btnRecordStep.Enabled = _isRecording;
-            btnClearSequence.Enabled = _recordedActions.Count > 0 && !_isRecording && !_isReplayingSequence;
-            btnStartRecording.Enabled = !_isRecording && !_isReplayingSequence;
-            btnStopRecording.Enabled = _isRecording;
-            btnEditStep.Enabled = hasSelection && !_isRecording && !_isReplayingSequence;
-            btnRemoveStep.Enabled = hasSelection && !_isRecording && !_isReplayingSequence;
-            chkMinimizeToTray.Enabled = !_isReplayingSequence;
+            notifyIconApp.Text = _captureNextActionForEdit
+                ? "Auto Mouse Click - Updating selected step"
+                : _pendingPlaceholderIndex >= 0
+                    ? "Auto Mouse Click - Waiting for next action"
+                    : _isRecording
+                        ? "Auto Mouse Click - Recording armed"
+                        : _isReplayingSequence
+                            ? "Auto Mouse Click - Replaying sequence"
+                            : "Auto Mouse Click - Stopped";
+            btnReplaySequence.Enabled = _recordedActions.Any(x => !x.IsPlaceholder) && !_isReplayingSequence && !_captureNextActionForEdit && _pendingPlaceholderIndex < 0;
+            btnRecordStep.Enabled = (_isRecording || (!_isRecording && hasSelection)) && !_captureNextActionForEdit && _pendingPlaceholderIndex < 0;
+            btnRecordStep.Text = !_isRecording && hasSelection ? "Capture into selected (F7)" : "Add pending step (F7)";
+            btnClearSequence.Enabled = _recordedActions.Count > 0 && !_isRecording && !_isReplayingSequence && !_captureNextActionForEdit && _pendingPlaceholderIndex < 0;
+            btnStartRecording.Enabled = !_isRecording && !_isReplayingSequence && !_captureNextActionForEdit;
+            btnStopRecording.Enabled = _isRecording && !_captureNextActionForEdit;
+            btnEditStep.Enabled = hasSelection && !_isRecording && !_isReplayingSequence && !_captureNextActionForEdit && _pendingPlaceholderIndex < 0;
+            btnRemoveStep.Enabled = hasSelection && !_isRecording && !_isReplayingSequence && !_captureNextActionForEdit;
+            chkMinimizeToTray.Enabled = !_isReplayingSequence && !_captureNextActionForEdit;
         }
 
         private void HideToTray()
@@ -589,6 +835,138 @@ namespace AutoMouseClick
             };
 
             File.WriteAllText(_settingsPath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
+        }
+
+        private void InstallCaptureHooks()
+        {
+            if (_keyboardHook != IntPtr.Zero || _mouseHook != IntPtr.Zero)
+            {
+                return;
+            }
+
+            using var process = System.Diagnostics.Process.GetCurrentProcess();
+            using var module = process.MainModule;
+            var moduleHandle = GetModuleHandle(module?.ModuleName);
+            _keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, _keyboardHookProc, moduleHandle, 0);
+            _mouseHook = SetWindowsHookEx(WH_MOUSE_LL, _mouseHookProc, moduleHandle, 0);
+        }
+
+        private void UninstallCaptureHooks()
+        {
+            if (_keyboardHook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_keyboardHook);
+                _keyboardHook = IntPtr.Zero;
+            }
+
+            if (_mouseHook != IntPtr.Zero)
+            {
+                UnhookWindowsHookEx(_mouseHook);
+                _mouseHook = IntPtr.Zero;
+            }
+        }
+
+        private IntPtr KeyboardHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
+            {
+                var keyCode = (Keys)Marshal.ReadInt32(lParam);
+                if (_ignoredCaptureKey.HasValue && keyCode == _ignoredCaptureKey.Value && !_ignoredCaptureKeyConsumed)
+                {
+                    _ignoredCaptureKeyConsumed = true;
+                    return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+                }
+
+                if (_captureNextActionForEdit || _pendingPlaceholderIndex >= 0)
+                {
+                    BeginInvoke(() =>
+                    {
+                        if (_captureNextActionForEdit)
+                        {
+                            CaptureEditedKeyboardAction(keyCode);
+                        }
+                        else if (_pendingPlaceholderIndex >= 0)
+                        {
+                            FillPendingPlaceholderWithKeyboard(keyCode);
+                        }
+                    });
+
+                    return (IntPtr)1;
+                }
+            }
+
+            return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
+        }
+
+        private IntPtr MouseHookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && (_captureNextActionForEdit || _pendingPlaceholderIndex >= 0))
+            {
+                var message = wParam.ToInt32();
+                if (TryGetMouseCapture(message, lParam, out var position, out var mouseButton, out var clickMode))
+                {
+                    BeginInvoke(() =>
+                    {
+                        if (_captureNextActionForEdit)
+                        {
+                            UpdateSelectedStepFromMouse(position, mouseButton, clickMode);
+                        }
+                        else if (_pendingPlaceholderIndex >= 0)
+                        {
+                            FillPendingPlaceholderWithMouse(position, mouseButton, clickMode);
+                        }
+                    });
+
+                    return (IntPtr)1;
+                }
+            }
+
+            return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
+        }
+
+        private static bool TryGetMouseCapture(int message, IntPtr lParam, out Point position, out MouseButtonType mouseButton, out ClickModeType clickMode)
+        {
+            position = Point.Empty;
+            mouseButton = MouseButtonType.Left;
+            clickMode = ClickModeType.Single;
+
+            if (lParam == IntPtr.Zero)
+            {
+                return false;
+            }
+
+            var hookData = Marshal.PtrToStructure<MSLLHOOKSTRUCT>(lParam);
+            position = new Point(hookData.pt.X, hookData.pt.Y);
+
+            switch (message)
+            {
+                case WM_LBUTTONDOWN:
+                    mouseButton = MouseButtonType.Left;
+                    clickMode = ClickModeType.Single;
+                    return true;
+                case WM_RBUTTONDOWN:
+                    mouseButton = MouseButtonType.Right;
+                    clickMode = ClickModeType.Single;
+                    return true;
+                case WM_MBUTTONDOWN:
+                    mouseButton = MouseButtonType.Middle;
+                    clickMode = ClickModeType.Single;
+                    return true;
+                case WM_LBUTTONDBLCLK:
+                    mouseButton = MouseButtonType.Left;
+                    clickMode = ClickModeType.Double;
+                    return true;
+                case WM_RBUTTONDBLCLK:
+                    mouseButton = MouseButtonType.Right;
+                    clickMode = ClickModeType.Double;
+                    return true;
+                case WM_MBUTTONDBLCLK:
+                    mouseButton = MouseButtonType.Middle;
+                    clickMode = ClickModeType.Double;
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 }
